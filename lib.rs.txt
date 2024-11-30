@@ -1,0 +1,593 @@
+use anchor_lang::{prelude::*, solana_program::program::invoke, solana_program::system_instruction,solana_program::program::invoke_signed };
+use anchor_lang::system_program;
+use anchor_lang::solana_program::rent::Rent;
+
+use anchor_spl::token::{mint_to, Mint, MintTo, Token, TokenAccount};
+use anchor_spl::token;
+use anchor_spl::associated_token::{self, AssociatedToken};
+use anchor_spl::metadata::{
+    create_master_edition_v3, create_metadata_accounts_v3, CreateMasterEditionV3,
+    CreateMetadataAccountsV3, Metadata as MetadataAcc
+};
+use anchor_spl::token_2022::spl_token_2022::solana_zk_token_sdk::instruction::PubkeyValidityData;
+use mpl_token_metadata::types::DataV2;
+use mpl_token_metadata::accounts::{ MasterEdition, Metadata as MetadataAccount};
+
+declare_id!("3rjCYzJShUGbraTo3rbR66FHGTtt2fBuj3TqPPgfBXrQ");
+
+/* 
+pub const SETTINGS: FairlaunchSettings = FairlaunchSettings {
+    supply: 1_000_000_000_000_000,
+    hard_cap: 2_000_000_000,
+    presale_tokens: 200_000_000_000_000,
+    presale_time_limit: 60 * 60 * 24,
+    buy_limit_min: 100_000_000,
+    buy_limit_max: 1_000_000_000,
+    buy_token_limit_max: 100_000_000_000_000,
+};
+*/
+
+#[constant]
+pub const ADMIN_PUBKEY: Pubkey = pubkey!("ooosbsBPNtkK4KZSkbqKvup2gs8q9Ud18KiQtCPxxiL");
+
+#[program]
+pub mod fairlaunch {
+    use super::*;
+
+    pub fn initialize_config(ctx: Context<InitializeConfig>) -> Result<()> {
+        let config_account = &mut ctx.accounts.config_account;
+        
+        config_account.supply = 1_000_000_000_000_000;
+        config_account.hard_cap = 2_000_000_000;
+        config_account.presale_tokens = 200_000_000_000_000;
+        config_account.presale_time_limit = 60 * 60 * 24;
+        //config.buy_limit_min = 100_000_000;
+        //config.buy_limit_max = 1_000_000_000;
+        config_account.buy_token_limit_max = 100_000_000_000_000;
+        config_account.mint_paused = false;
+        config_account.bump = ctx.bumps.config_account;
+
+        Ok(())
+    }
+
+    pub fn update_config(
+        ctx: Context<UpdateConfig>,
+        supply: u64,
+        hard_cap: u64,
+        presale_tokens: u64,
+        presale_time_limit: u32,
+        //buy_limit_min: u64,
+        //buy_limit_max: u64,
+        buy_token_limit_max: u64
+    ) -> Result<()> {
+        let config_account = &mut ctx.accounts.config_account;
+        
+        if supply > 0 {
+            config_account.supply = supply;
+        }
+        if hard_cap > 0 {
+            config_account.hard_cap = hard_cap;
+        }
+        if presale_tokens > 0 {
+            config_account.presale_tokens = presale_tokens;
+        }
+        if presale_time_limit > 0 {
+            config_account.presale_time_limit = presale_time_limit;
+        }
+        /*
+        if buy_limit_min > 0 {
+            config.buy_limit_min = buy_limit_min;
+        }
+        if buy_limit_max > 0 {
+            config.buy_limit_max = buy_limit_max;
+        }
+         */
+        if buy_token_limit_max > 0 {
+            config_account.buy_token_limit_max = buy_token_limit_max;
+        }
+        
+        Ok(())
+    }
+
+    pub fn toggle_pause_mint(
+        ctx: Context<TogglePauseMint>,
+        mint_paused: bool
+    ) -> Result<()> {
+        let config_account = &mut ctx.accounts.config_account;
+
+        config_account.mint_paused = mint_paused;
+
+        Ok(())
+    }
+
+    pub fn mint_token(
+        ctx: Context<MintToken>,
+        name: String,
+        symbol: String,
+        uri: String,
+        //amount_in: u64,
+    ) -> Result<()> {
+        let sender = &ctx.accounts.sender;
+        let mint = &ctx.accounts.mint;
+        //let sender_token_account = &ctx.accounts.sender_token_account;
+        let fairlaunch_account = &mut ctx.accounts.fairlaunch_account;
+        let fairlaunch_token_account = &ctx.accounts.fairlaunch_token_account;
+        let token_program = &ctx.accounts.token_program;
+        let associated_token_program =  &ctx.accounts.associated_token_program;
+        let metadata_account = &ctx.accounts.metadata_account;
+        let config_account = &ctx.accounts.config_account;
+        let token_metadata_program = &ctx.accounts.token_metadata_program;
+        let system_program = &ctx.accounts.system_program;
+        let rent = &ctx.accounts.rent;
+        let mint_key = mint.key();
+        let signer_seeds: &[&[&[u8]]] = &[&[b"fairlaunch".as_ref(), mint_key.as_ref(), &[ctx.bumps.fairlaunch_account]]];
+
+        assert!( !config_account.mint_paused, "mint is paused" );
+
+        let clock = Clock::get()?;
+        let current_timestamp = clock.unix_timestamp;
+
+        fairlaunch_account.supply = config_account.supply;
+        fairlaunch_account.virtual_tokens = config_account.presale_tokens;
+        fairlaunch_account.virtual_sol = 0;
+        fairlaunch_account.tokens_per_sol = config_account.presale_tokens / config_account.hard_cap;
+        fairlaunch_account.start_time = current_timestamp as u32;
+        fairlaunch_account.bump = ctx.bumps.fairlaunch_account;
+
+        mint_to(
+            CpiContext::new_with_signer(
+                token_program.to_account_info(),
+                MintTo {
+                    mint: mint.to_account_info(),
+                    to: fairlaunch_token_account.to_account_info(),
+                    authority: fairlaunch_account.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            fairlaunch_account.supply,
+        )?; 
+
+        let cpi_context = CpiContext::new_with_signer(
+            token_metadata_program.to_account_info(),
+            CreateMetadataAccountsV3 {
+                metadata: metadata_account.to_account_info(),
+                mint: mint.to_account_info(),
+                mint_authority: fairlaunch_account.to_account_info(),
+                update_authority: fairlaunch_account.to_account_info(),
+                payer: sender.to_account_info(),
+                system_program: system_program.to_account_info(),
+                rent: rent.to_account_info()
+            },
+            signer_seeds,
+        );
+
+        let data_v2 = DataV2 {
+            name: name,
+            symbol: symbol,
+            uri: uri,
+            seller_fee_basis_points: 0,
+            creators: None,
+            collection: None,
+            uses: None,
+        };
+
+        create_metadata_accounts_v3(cpi_context, data_v2, false, true, None)?;
+
+        let cpi_accounts = token::SetAuthority {
+            current_authority: fairlaunch_account.to_account_info(),
+            account_or_mint: mint.to_account_info(),
+        };
+
+        let cpi_ctx = CpiContext::new_with_signer(
+            token_program.to_account_info(),
+            cpi_accounts,
+            signer_seeds,
+        );
+
+        token::set_authority(
+            cpi_ctx,
+            token::spl_token::instruction::AuthorityType::MintTokens,
+            None
+        )?;
+
+        let cpi_accounts = token::SetAuthority {
+            current_authority: fairlaunch_account.to_account_info(),
+            account_or_mint: mint.to_account_info(),
+        };
+
+        let cpi_ctx = CpiContext::new_with_signer(
+            token_program.to_account_info(),
+            cpi_accounts,
+            signer_seeds,
+        );
+
+        token::set_authority(
+            cpi_ctx,
+            token::spl_token::instruction::AuthorityType::FreezeAccount,
+            None
+        )?;
+
+        emit!(MintEvent {
+            token: mint.key(),
+            maker: sender.key(),
+            supply: fairlaunch_account.supply,
+        });
+
+        Ok(())
+    }
+
+    pub fn buy(
+        ctx: Context<Buy>,
+        amount_in: u64,
+    ) -> Result<()> { 
+        let sender = &ctx.accounts.sender;
+        let sender_token_account = &ctx.accounts.sender_token_account;
+        let mint = &ctx.accounts.mint;
+        let fairlaunch_account = &mut ctx.accounts.fairlaunch_account;
+        let fairlaunch_token_account = &ctx.accounts.fairlaunch_token_account;
+        let config_account = &ctx.accounts.config_account;
+        let token_program = &ctx.accounts.token_program;
+        let system_program = &ctx.accounts.system_program;
+
+        //assert!( amount_in >= SETTINGS.buy_limit_min, "minimum buy limit is {} lamports", SETTINGS.buy_limit_min);
+        //assert!( amount_in <= SETTINGS.buy_limit_max, "maximum buy limit is {} lamports", SETTINGS.buy_limit_max);
+        assert!( !fairlaunch_account.completed, "pool is completed" );
+
+        let clock = Clock::get()?;
+        let current_timestamp = clock.unix_timestamp as u32;
+        //assert!(current_timestamp >= fairlaunch_account.start_time + SETTINGS.presale_time_limit, "fairlaunch is closed by time");
+
+        let mut amount_out = amount_in * fairlaunch_account.tokens_per_sol;
+        let mut amount_in = amount_in;
+        
+        let difference : i64 = fairlaunch_account.virtual_tokens as i64 - amount_out as i64;    
+        if difference <= 0 {
+            amount_out -= difference.abs() as u64;
+            amount_in -= difference.abs() as u64 / fairlaunch_account.tokens_per_sol;
+            fairlaunch_account.completed = true;
+
+            emit!(DexListingEvent {
+                token: mint.key(),
+                sol_amount: fairlaunch_account.virtual_sol + amount_in
+            });
+        } 
+
+        let all_user_tokens =  sender_token_account.amount;
+        assert!( all_user_tokens + amount_out <= config_account.buy_token_limit_max, "maximum buy limit is {} tokens", config_account.buy_token_limit_max);
+
+        fairlaunch_account.virtual_tokens -= amount_out;
+        fairlaunch_account.virtual_sol += amount_in;
+
+        system_program::transfer(
+            CpiContext::new(
+                system_program.to_account_info(),
+                system_program::Transfer {
+                    from: sender.to_account_info(),
+                    to: fairlaunch_account.to_account_info(),
+                },
+            ),
+            amount_in
+        )?;
+
+        token::transfer(
+            CpiContext::new_with_signer(
+                token_program.to_account_info(),
+                token::Transfer {
+                    from: fairlaunch_token_account.to_account_info(),
+                    to: sender_token_account.to_account_info(),
+                    authority: fairlaunch_account.to_account_info(),
+                },
+                &[&[
+                    b"fairlaunch".as_ref(), 
+                    mint.key().as_ref(), 
+                    &[fairlaunch_account.bump]   
+                ]]
+            ),
+            amount_out
+        )?;
+
+        emit!(BuyEvent {
+            token: mint.key(),
+            maker: sender.key(),
+            amount: amount_out,
+            sol_amount: amount_in,
+            all_tokens: fairlaunch_account.virtual_tokens,
+            all_sol: fairlaunch_account.virtual_sol
+        });
+
+        Ok(())
+    }
+
+    pub fn sell(
+        ctx: Context<Sell>,
+        amount_in: u64,
+    ) -> Result<()> {
+        let sender = &ctx.accounts.sender;
+        let sender_token_account = &ctx.accounts.sender_token_account;
+        let mint = &ctx.accounts.mint;
+        let fairlaunch_account = &mut ctx.accounts.fairlaunch_account;
+        let fairlaunch_token_account = &ctx.accounts.fairlaunch_token_account;
+        let config_account = &ctx.accounts.config_account;
+        let fee_account = &ctx.accounts.fee_account;
+        let token_program = &ctx.accounts.token_program;
+        let system_program = &ctx.accounts.system_program;
+        let mint_key = mint.key();
+    
+        assert!( !fairlaunch_account.completed, "pool is completed" );
+
+        let clock = Clock::get()?;
+        let current_timestamp = clock.unix_timestamp as u32;
+        //assert!(current_timestamp >= fairlaunch_account.start_time + SETTINGS.presale_time_limit, "fairlaunch is closed by time");
+
+        let mut amount_out = amount_in / fairlaunch_account.tokens_per_sol;
+        fairlaunch_account.virtual_sol -= amount_out;
+        fairlaunch_account.virtual_tokens += amount_in;
+
+        token::transfer(
+            CpiContext::new(
+                token_program.to_account_info(),
+                token::Transfer {
+                    from: sender_token_account.to_account_info(),
+                    to: fairlaunch_token_account.to_account_info(),
+                    authority: sender.to_account_info(),
+                },
+            ),
+            amount_in,
+        )?;
+
+        let fee_out = amount_out / 100;
+        
+       **fairlaunch_account.to_account_info().try_borrow_mut_lamports()? -= amount_out;
+       **sender.to_account_info().try_borrow_mut_lamports()? += amount_out - fee_out;
+       **fee_account.to_account_info().try_borrow_mut_lamports()? += fee_out;
+
+        emit!(SellEvent {
+            token: mint_key,
+            maker: sender.key(),
+            amount: amount_in,
+            sol_amount: amount_out,
+            all_tokens: fairlaunch_account.virtual_tokens,
+            all_sol: fairlaunch_account.virtual_sol
+        });
+
+        Ok(())
+    }
+
+    pub fn dex_listing(
+        ctx: Context<DexListing>
+    ) -> Result<()> {
+        let admin = &ctx.accounts.admin;
+        let fairlaunch_account = &mut ctx.accounts.fairlaunch_account;
+        let fairlaunch_token_account = &ctx.accounts.fairlaunch_token_account;
+        let mint = &ctx.accounts.mint;
+        let dex_program = &ctx.accounts.dex_program;
+        let token_program = &ctx.accounts.token_program;
+        let system_program = &ctx.accounts.system_program;
+
+        let all_sol = fairlaunch_account.virtual_sol;
+        **fairlaunch_account.to_account_info().try_borrow_mut_lamports()? -= all_sol;
+        **admin.to_account_info().try_borrow_mut_lamports()? += all_sol;
+
+        Ok(())
+    }
+
+}
+
+#[account]
+pub struct Config {
+    pub supply: u64, // 8
+    pub hard_cap: u64, // 8
+    pub presale_tokens: u64, // 8,
+    pub presale_time_limit: u32, // 4
+    pub buy_token_limit_max: u64, // 8
+    pub mint_paused: bool, // 1
+    pub bump: u8, // 1
+}
+
+#[account]
+pub struct Fairlaunch {
+    pub supply : u64, // 8
+    pub virtual_tokens: u64, // 8
+    pub virtual_sol: u64, // 8
+    pub tokens_per_sol: u64, // 8
+    pub start_time: u32, // 4
+    pub completed : bool, // 1
+    bump: u8, // 1
+}
+
+#[derive(Accounts)]
+pub struct InitializeConfig<'info> {
+    #[account(mut, constraint = admin.key() == ADMIN_PUBKEY)]
+    pub admin: Signer<'info>,
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + 8 + 8 + 4 + 8 + 1 + 1 + 8,
+        seeds = [b"config".as_ref()],
+        bump
+    )]
+    pub config_account: Account<'info, Config>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateConfig<'info> {
+    #[account(constraint = admin.key() == ADMIN_PUBKEY)]
+    pub admin: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"config".as_ref()],
+        bump = config_account.bump
+    )]
+    pub config_account: Account<'info, Config>,
+}
+
+#[derive(Accounts)]
+pub struct TogglePauseMint<'info> {
+    #[account(constraint = admin.key() == ADMIN_PUBKEY)]
+    pub admin: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"config".as_ref()],
+        bump = config_account.bump
+    )]
+    pub config_account: Account<'info, Config>,
+}
+
+#[derive(Accounts)]
+pub struct MintToken<'info> { 
+    #[account(mut)]
+    pub sender: Signer<'info>,
+    #[account(
+        init,
+        payer = sender,
+        mint::decimals = 6,
+        mint::authority = fairlaunch_account,
+        mint::freeze_authority = fairlaunch_account,
+    )]
+    pub mint: Account<'info, Mint>,
+    /*
+    #[account(
+        init,
+        payer = sender,
+        associated_token::mint = mint,
+        associated_token::authority = sender,
+    )]
+    pub sender_token_account: Account<'info, TokenAccount>,
+    */
+    #[account(init, payer = sender, space = 8 + 8 + 8 + 8 + 4 + 1 + 1 + 8, seeds = [b"fairlaunch".as_ref(), mint.key().as_ref()], bump)]
+    pub fairlaunch_account: Account<'info, Fairlaunch>,
+    #[account(
+        init,
+        payer = sender,
+        associated_token::mint = mint,
+        associated_token::authority = fairlaunch_account,
+    )]
+    pub fairlaunch_token_account: Account<'info, TokenAccount>,
+    /// CHECK: Address validated using constraint
+    #[account(
+        mut,
+        address=MetadataAccount::find_pda(&mint.key()).0,
+    )]
+    pub metadata_account: UncheckedAccount<'info>, 
+    #[account(seeds = [b"config".as_ref()], bump = config_account.bump)]
+    pub config_account : Account<'info, Config>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, associated_token::AssociatedToken>,
+    pub token_metadata_program: Program<'info, MetadataAcc>, 
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct Buy<'info> { 
+    #[account(mut)]
+    pub sender: Signer<'info>,
+    #[account(
+        init_if_needed,
+        payer = sender,
+        associated_token::mint = mint,
+        associated_token::authority = sender,
+    )]
+    pub sender_token_account: Account<'info, TokenAccount>,
+    pub mint: Account<'info, Mint>,
+    #[account(mut, seeds = [b"fairlaunch".as_ref(), mint.key().as_ref()], bump = fairlaunch_account.bump)]
+    pub fairlaunch_account: Account<'info, Fairlaunch>,
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = fairlaunch_account,
+    )]
+    pub fairlaunch_token_account: Account<'info, TokenAccount>,
+    #[account(seeds = [b"config".as_ref()], bump = config_account.bump)]
+    pub config_account : Account<'info, Config>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, associated_token::AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct Sell<'info> { 
+    #[account(mut)]
+    pub sender: Signer<'info>,
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = sender,
+    )]
+    pub sender_token_account: Account<'info, TokenAccount>,
+    pub mint: Account<'info, Mint>,
+    #[account(mut, seeds = [b"fairlaunch".as_ref(), mint.key().as_ref()], bump = fairlaunch_account.bump)]
+    pub fairlaunch_account: Account<'info, Fairlaunch>,
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = fairlaunch_account,
+    )]
+    pub fairlaunch_token_account: Account<'info, TokenAccount>,
+    #[account(seeds = [b"config".as_ref()], bump = config_account.bump)]
+    pub config_account : Account<'info, Config>,
+    /// CHECK: Address validated using constraint
+    #[account(mut, constraint = fee_account.key() == ADMIN_PUBKEY)]
+    pub fee_account: AccountInfo<'info>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, associated_token::AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct DexListing<'info> { 
+    #[account(mut, constraint = admin.key() == ADMIN_PUBKEY)]
+    pub admin: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"fairlaunch".as_ref(), mint.key().as_ref()], 
+        bump = fairlaunch_account.bump
+    )]
+    pub fairlaunch_account: Account<'info, Fairlaunch>,
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = fairlaunch_account,
+    )]
+    pub fairlaunch_token_account: Account<'info, TokenAccount>,
+    pub mint: Account<'info, Mint>,
+    pub dex_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[event]
+pub struct MintEvent {
+    token: Pubkey,
+    maker: Pubkey,
+    supply: u64,
+}
+
+#[event]
+pub struct BuyEvent {
+    token: Pubkey,
+    maker: Pubkey,
+    amount: u64,
+    sol_amount: u64, 
+    all_tokens: u64,
+    all_sol: u64
+}
+
+#[event]
+pub struct SellEvent {
+    token: Pubkey,
+    maker: Pubkey,
+    amount: u64,
+    sol_amount: u64, 
+    all_tokens: u64,
+    all_sol: u64
+}
+
+#[event]
+pub struct DexListingEvent {
+    token: Pubkey,
+    sol_amount: u64, 
+}
